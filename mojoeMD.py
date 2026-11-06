@@ -1,20 +1,33 @@
 #!/usr/bin/env python
 
 import argparse
+import itertools
 import json
 import logging
 import math
 import os
+import random
 import sys
 import time
 import xml.etree.ElementTree as ET
 import importlib.util
+from dataclasses import dataclass
 from pathlib import Path
 from collections import defaultdict, deque
 
+import numpy as np
 import pdbfixer
 
-from openmm import CustomBondForce, CustomExternalForce, LangevinMiddleIntegrator, MonteCarloBarostat, Platform, State, XmlSerializer
+from openmm import (
+    CustomBondForce,
+    CustomExternalForce,
+    CustomTorsionForce,
+    LangevinMiddleIntegrator,
+    MonteCarloBarostat,
+    Platform,
+    State,
+    XmlSerializer,
+)
 from openmm.app import (
     PME,
     DCDReporter,
@@ -27,7 +40,9 @@ from openmm.app import (
     Topology,
     CheckpointReporter,
 )
+from openmm.app.metadynamics import BiasVariable, Metadynamics
 from openmm.unit import (
+    MOLAR_GAS_CONSTANT_R,
     Quantity,
     amu,
     bar,
@@ -321,8 +336,60 @@ def validate_input_files(args: argparse.Namespace) -> None:
     if args.membrane:
         ok = validate_openmm_app_data_file(args.lipid_ff, "Lipid force field") and ok
 
+    if args.metadynamics and args.metadynamics.get("enabled"):
+        ok = validate_metadynamics_config(args.metadynamics) and ok
+
+    if args.bias_exchange and args.bias_exchange.get("enabled"):
+        if args.metadynamics and args.metadynamics.get("enabled"):
+            logging.error("metadynamics.enabled and bias_exchange.enabled cannot both be true.")
+            ok = False
+
+        ok = validate_bias_exchange_config(args.bias_exchange) and ok
+
     if not ok:
         sys.exit(1)
+
+
+def validate_metadynamics_config(metad_config: dict) -> bool:
+    cvs = metad_config.get("cvs")
+
+    if not cvs:
+        logging.error("metadynamics.enabled is true but no 'cvs' were provided.")
+        return False
+
+    if len(cvs) > 3:
+        logging.error(f"metadynamics supports at most 3 collective variables, got {len(cvs)}.")
+        return False
+
+    ok = True
+
+    for i, cv in enumerate(cvs):
+        if cv.get("type") not in ("phi", "psi"):
+            logging.error(f"metadynamics.cvs[{i}]: 'type' must be 'phi' or 'psi', got {cv.get('type')!r}.")
+            ok = False
+
+        if cv.get("residue") is None:
+            logging.error(f"metadynamics.cvs[{i}]: 'residue' is required.")
+            ok = False
+
+    return ok
+
+
+def validate_bias_exchange_config(bias_exchange_config: dict) -> bool:
+    walkers = bias_exchange_config.get("walkers")
+
+    if not walkers or len(walkers) < 2:
+        logging.error("bias_exchange.enabled is true but fewer than 2 'walkers' were provided.")
+        return False
+
+    ok = True
+
+    for i, walker_cfg in enumerate(walkers):
+        if not validate_metadynamics_config(walker_cfg):
+            logging.error(f"bias_exchange.walkers[{i}]: invalid 'cvs'.")
+            ok = False
+
+    return ok
 
 
 def select_platform(platform_name: str | None = None) -> Platform:
@@ -2208,6 +2275,517 @@ def run_equilibrate(args: argparse.Namespace) -> None:
     logging.info("--- EQUILIBRATION STAGE COMPLETE ---")
 
 
+# ============================================================
+# ENHANCED SAMPLING / METADYNAMICS HELPERS
+# ============================================================
+
+BACKBONE_DIHEDRAL_TYPES = ("phi", "psi")
+
+
+def resolve_phi_psi_atoms(
+    topology: Topology,
+    cv_type: str,
+    residue_id,
+    chain_id: str | None = None,
+) -> tuple[int, int, int, int]:
+    if cv_type not in BACKBONE_DIHEDRAL_TYPES:
+        raise ValueError(f"Unsupported torsion CV type '{cv_type}'. Must be one of {BACKBONE_DIHEDRAL_TYPES}.")
+
+    matches = []
+
+    for chain in topology.chains():
+        if chain_id is not None and chain.id != str(chain_id):
+            continue
+
+        residues = list(chain.residues())
+
+        for i, residue in enumerate(residues):
+            if residue.id != str(residue_id):
+                continue
+
+            if cv_type == "phi":
+                if i == 0:
+                    raise ValueError(
+                        f"Cannot compute phi for residue {residue_id} in chain {chain.id}: "
+                        "it is the first residue in its chain (no preceding C atom)."
+                    )
+                prev_residue = residues[i - 1]
+                try:
+                    atoms = (
+                        next(a.index for a in prev_residue.atoms() if a.name == "C"),
+                        next(a.index for a in residue.atoms() if a.name == "N"),
+                        next(a.index for a in residue.atoms() if a.name == "CA"),
+                        next(a.index for a in residue.atoms() if a.name == "C"),
+                    )
+                except StopIteration:
+                    raise ValueError(
+                        f"Could not find N/CA/C backbone atoms for phi of residue {residue_id} "
+                        f"in chain {chain.id}."
+                    )
+            else:
+                if i == len(residues) - 1:
+                    raise ValueError(
+                        f"Cannot compute psi for residue {residue_id} in chain {chain.id}: "
+                        "it is the last residue in its chain (no following N atom)."
+                    )
+                next_residue = residues[i + 1]
+                try:
+                    atoms = (
+                        next(a.index for a in residue.atoms() if a.name == "N"),
+                        next(a.index for a in residue.atoms() if a.name == "CA"),
+                        next(a.index for a in residue.atoms() if a.name == "C"),
+                        next(a.index for a in next_residue.atoms() if a.name == "N"),
+                    )
+                except StopIteration:
+                    raise ValueError(
+                        f"Could not find N/CA/C backbone atoms for psi of residue {residue_id} "
+                        f"in chain {chain.id}."
+                    )
+
+            matches.append((chain.id, atoms))
+
+    if not matches:
+        chain_hint = f" in chain {chain_id}" if chain_id is not None else ""
+        raise ValueError(f"No residue with id {residue_id}{chain_hint} was found in the topology.")
+
+    if len(matches) > 1:
+        chains_found = ", ".join(c for c, _ in matches)
+        raise ValueError(
+            f"Residue id {residue_id} is ambiguous: found in chains {chains_found}. "
+            "Specify 'chain' in the metadynamics CV config to disambiguate."
+        )
+
+    return matches[0][1]
+
+
+def build_metadynamics(
+    system,
+    topology: Topology,
+    metad_config: dict,
+    temperature: Quantity,
+    dt_ps: float,
+) -> tuple[Metadynamics, list[str], list[tuple[int, int, int, int]]]:
+    variables = []
+    cv_labels = []
+    cv_atoms = []
+
+    for cv in metad_config["cvs"]:
+        cv_type = cv["type"]
+        residue_id = cv["residue"]
+        chain_id = cv.get("chain")
+        bias_width_degrees = cv.get("bias_width_degrees", 25.0)
+        grid_width = cv.get("grid_width")
+
+        atoms = resolve_phi_psi_atoms(topology, cv_type, residue_id, chain_id)
+
+        force = CustomTorsionForce("theta")
+        force.addTorsion(*atoms)
+
+        variables.append(
+            BiasVariable(
+                force,
+                -math.pi,
+                math.pi,
+                math.radians(bias_width_degrees),
+                periodic=True,
+                gridWidth=grid_width,
+            )
+        )
+
+        label = f"{cv_type}_{chain_id or ''}{residue_id}"
+        cv_labels.append(label)
+        cv_atoms.append(atoms)
+        logging.info(
+            f"Metadynamics CV '{label}': atoms={atoms}, bias_width={bias_width_degrees} deg, "
+            f"grid_width={grid_width or 'auto'}"
+        )
+
+    bias_factor = metad_config.get("bias_factor", 10.0)
+    height_kjmol = metad_config.get("height_kjmol", 1.2)
+    deposition_interval_ps = metad_config.get("deposition_interval_ps", 1.0)
+    save_interval_ps = metad_config.get("save_interval_ps", 100.0)
+
+    frequency = max(1, round(deposition_interval_ps / dt_ps))
+    save_frequency = max(frequency, round(save_interval_ps / dt_ps))
+    if save_frequency % frequency != 0:
+        save_frequency = frequency * round(save_frequency / frequency)
+        logging.warning(
+            f"Rounded metadynamics save_interval_ps so it is a multiple of the deposition "
+            f"interval: save_frequency={save_frequency} steps, frequency={frequency} steps."
+        )
+
+    bias_dir = metad_config["_bias_dir"]
+    os.makedirs(bias_dir, exist_ok=True)
+
+    meta = Metadynamics(
+        system,
+        variables,
+        temperature,
+        biasFactor=bias_factor,
+        height=height_kjmol * kilojoules_per_mole,
+        frequency=frequency,
+        saveFrequency=save_frequency,
+        biasDir=bias_dir,
+    )
+
+    logging.info(
+        f"Metadynamics enabled: CVs={cv_labels}, bias_factor={bias_factor}, "
+        f"height={height_kjmol} kJ/mol, frequency={frequency} steps, "
+        f"save_frequency={save_frequency} steps, bias_dir={bias_dir}"
+    )
+
+    return meta, cv_labels, cv_atoms
+
+
+class MetadynamicsCVReporter:
+    def __init__(self, meta: Metadynamics, cv_labels: list[str], csv_path: str, report_interval: int) -> None:
+        self._meta = meta
+        self._cv_labels = cv_labels
+        self._reportInterval = report_interval
+        self._csv_path = csv_path
+
+        with open(self._csv_path, "w") as f:
+            f.write("step,time_ps," + ",".join(f"{label}_deg" for label in cv_labels) + "\n")
+
+    def describeNextReport(self, simulation: Simulation) -> tuple[int, bool, bool, bool, bool, bool]:
+        steps = self._reportInterval - simulation.currentStep % self._reportInterval
+        return (steps, False, False, False, False, False)
+
+    def report(self, simulation: Simulation, state: State) -> None:
+        dt_ps = simulation.integrator.getStepSize().value_in_unit(picoseconds)
+        time_ps = simulation.currentStep * dt_ps
+        values_deg = [math.degrees(v) for v in self._meta.getCollectiveVariables(simulation)]
+
+        with open(self._csv_path, "a") as f:
+            f.write(f"{simulation.currentStep},{time_ps:.3f}," + ",".join(f"{v:.3f}" for v in values_deg) + "\n")
+
+
+# ============================================================
+# BIAS-EXCHANGE METADYNAMICS
+# ============================================================
+#
+# Multiple walkers, each biasing a different torsion CV, periodically attempt to swap
+# configurations. Because every walker shares the same force field and topology, the
+# unbiased potential energy cancels out of the exchange criterion, leaving only the
+# walkers' bias values:
+#
+#   delta = beta * [V_i(CV_i at x_j) + V_j(CV_j at x_i) - V_i(CV_i at x_i) - V_j(CV_j at x_j)]
+#   accept with probability min(1, exp(-delta))
+#
+# so no full-system energy evaluation is needed for the exchange test itself.
+
+
+def compute_dihedral_radians(positions: np.ndarray, atom_indices: tuple[int, int, int, int]) -> float:
+    i, j, k, l = atom_indices
+    b1 = positions[j] - positions[i]
+    b2 = positions[k] - positions[j]
+    b3 = positions[l] - positions[k]
+
+    n1 = np.cross(b1, b2)
+    n2 = np.cross(b2, b3)
+    m1 = np.cross(b2 / np.linalg.norm(b2), n1)
+
+    x = np.dot(n1, n2)
+    y = np.dot(m1, n2)
+
+    return float(math.atan2(y, x))
+
+
+def evaluate_metadynamics_bias(meta: Metadynamics, cv_values_radians: list[float]) -> float:
+    """Linearly interpolate Metadynamics' accumulated bias at an arbitrary CV point.
+
+    OpenMM's public Metadynamics API only evaluates the bias through the live CustomCVForce
+    table inside a Context (cubic-spline interpolation). This reads the private
+    _totalBias/_limits arrays instead, so the bias-exchange Metropolis test can be evaluated
+    for a *foreign* configuration without needing a Context for it. Only this acceptance test
+    uses the (linear, slightly less accurate than OpenMM's spline) approximation; the biased
+    dynamics themselves are driven entirely by OpenMM's own meta.step().
+    """
+    variables = meta.variables
+    n = len(variables)
+    bias = meta._totalBias
+
+    fractions = []
+    for i, v in enumerate(variables):
+        x = (cv_values_radians[i] - v.minValue) / (v.maxValue - v.minValue)
+        if v.periodic:
+            x = x % 1.0
+        fractions.append(x * (v.gridWidth - 1))
+
+    # numpy axis order is reversed relative to variable order (see Metadynamics._addGaussian).
+    axis_fracs = list(reversed(fractions))
+    grid_widths = [v.gridWidth for v in reversed(variables)]
+    periodics = [v.periodic for v in reversed(variables)]
+
+    lowers = [int(math.floor(f)) for f in axis_fracs]
+    weights = [f - lo for f, lo in zip(axis_fracs, lowers)]
+
+    total = 0.0
+    for corner in itertools.product((0, 1), repeat=n):
+        idx = []
+        weight = 1.0
+        for c, lo, w, gw, periodic in zip(corner, lowers, weights, grid_widths, periodics):
+            gi = lo + c
+            if periodic:
+                gi = gi % gw
+            else:
+                gi = min(max(gi, 0), gw - 1)
+            idx.append(gi)
+            weight *= w if c == 1 else (1.0 - w)
+        total += weight * bias[tuple(idx)]
+
+    return float(total)
+
+
+def metropolis_exchange_delta(
+    walker_i: "BiasExchangeWalker",
+    walker_j: "BiasExchangeWalker",
+    positions_i: np.ndarray,
+    positions_j: np.ndarray,
+    temperature: Quantity,
+) -> float:
+    kT = (MOLAR_GAS_CONSTANT_R * temperature).value_in_unit(kilojoules_per_mole)
+
+    cv_i_at_i = [compute_dihedral_radians(positions_i, atoms) for atoms in walker_i.cv_atoms]
+    cv_i_at_j = [compute_dihedral_radians(positions_j, atoms) for atoms in walker_i.cv_atoms]
+    cv_j_at_i = [compute_dihedral_radians(positions_i, atoms) for atoms in walker_j.cv_atoms]
+    cv_j_at_j = [compute_dihedral_radians(positions_j, atoms) for atoms in walker_j.cv_atoms]
+
+    v_i_i = evaluate_metadynamics_bias(walker_i.meta, cv_i_at_i)
+    v_i_j = evaluate_metadynamics_bias(walker_i.meta, cv_i_at_j)
+    v_j_i = evaluate_metadynamics_bias(walker_j.meta, cv_j_at_i)
+    v_j_j = evaluate_metadynamics_bias(walker_j.meta, cv_j_at_j)
+
+    return (v_i_j + v_j_i - v_i_i - v_j_j) / kT
+
+
+@dataclass
+class BiasExchangeWalker:
+    index: int
+    simulation: Simulation
+    meta: Metadynamics
+    cv_labels: list[str]
+    cv_atoms: list[tuple[int, int, int, int]]
+    output_dir: str
+    checkpoint_path: str
+    final_checkpoint_path: str
+
+
+def attempt_exchange(
+    walker_i: BiasExchangeWalker,
+    walker_j: BiasExchangeWalker,
+    temperature: Quantity,
+) -> tuple[bool, float]:
+    state_i = walker_i.simulation.context.getState(getPositions=True, getVelocities=True, enforcePeriodicBox=True)
+    state_j = walker_j.simulation.context.getState(getPositions=True, getVelocities=True, enforcePeriodicBox=True)
+
+    positions_i = state_i.getPositions(asNumpy=True).value_in_unit(nanometer)
+    positions_j = state_j.getPositions(asNumpy=True).value_in_unit(nanometer)
+
+    delta = metropolis_exchange_delta(walker_i, walker_j, positions_i, positions_j, temperature)
+    accepted = delta <= 0.0 or random.random() < math.exp(-delta)
+
+    if accepted:
+        box_i = state_i.getPeriodicBoxVectors()
+        box_j = state_j.getPeriodicBoxVectors()
+
+        walker_i.simulation.context.setPositions(state_j.getPositions())
+        walker_i.simulation.context.setVelocities(state_j.getVelocities())
+        walker_i.simulation.context.setPeriodicBoxVectors(*box_j)
+
+        walker_j.simulation.context.setPositions(state_i.getPositions())
+        walker_j.simulation.context.setVelocities(state_i.getVelocities())
+        walker_j.simulation.context.setPeriodicBoxVectors(*box_i)
+
+    return accepted, delta
+
+
+def build_bias_exchange_walkers(
+    args: argparse.Namespace,
+    topology: Topology,
+    system_xml_string: str,
+    temperature: Quantity,
+    dt_ps: float,
+    platform: Platform,
+) -> list[BiasExchangeWalker]:
+    equil_state_path = os.path.join(args.output_dir, "equilibrated.xml")
+    walkers = []
+
+    for i, walker_cfg in enumerate(args.bias_exchange["walkers"]):
+        walker_dir = os.path.join(args.output_dir, f"walker_{i:02d}")
+        os.makedirs(walker_dir, exist_ok=True)
+
+        system = XmlSerializer.deserialize(system_xml_string)
+
+        metad_config = dict(walker_cfg)
+        metad_config["_bias_dir"] = os.path.join(walker_dir, metad_config.get("bias_dir", "metad_bias"))
+
+        meta, cv_labels, cv_atoms = build_metadynamics(system, topology, metad_config, temperature, dt_ps)
+
+        integrator = LangevinMiddleIntegrator(temperature, 1 / picosecond, args.timestep_fs * femtoseconds)
+        simulation = Simulation(topology, system, integrator, platform)
+
+        checkpoint_path = os.path.join(walker_dir, "production.chk")
+        final_checkpoint_path = os.path.join(walker_dir, "production_final.chk")
+
+        if args.restart:
+            restart_candidates = [p for p in [final_checkpoint_path, checkpoint_path] if os.path.exists(p)]
+
+            if not restart_candidates:
+                logging.error(f"--restart was requested, but no checkpoint file was found for walker {i}.")
+                sys.exit(1)
+
+            latest_checkpoint = max(restart_candidates, key=os.path.getmtime)
+            logging.info(f"Walker {i}: restart requested. Loading checkpoint from {latest_checkpoint}")
+            simulation.loadCheckpoint(latest_checkpoint)
+        else:
+            logging.info(f"Walker {i}: loading state from {equil_state_path}")
+            simulation.loadState(equil_state_path)
+
+        walkers.append(
+            BiasExchangeWalker(
+                index=i,
+                simulation=simulation,
+                meta=meta,
+                cv_labels=cv_labels,
+                cv_atoms=cv_atoms,
+                output_dir=walker_dir,
+                checkpoint_path=checkpoint_path,
+                final_checkpoint_path=final_checkpoint_path,
+            )
+        )
+
+    return walkers
+
+
+def run_production_bias_exchange(args: argparse.Namespace) -> None:
+    logging.info("--- STAGE 3: PRODUCTION MD (BIAS-EXCHANGE METADYNAMICS) ---")
+
+    equil_system_path = os.path.join(args.output_dir, "equilibrated_system.xml")
+    equil_pdb_path = os.path.join(args.output_dir, "equilibrated.pdb")
+    equil_state_path = os.path.join(args.output_dir, "equilibrated.xml")
+
+    if not all(os.path.exists(p) for p in [equil_system_path, equil_pdb_path]):
+        logging.error("Cannot find equilibrated files. Please run --prepare and --equilibrate first.")
+        sys.exit(1)
+
+    if not args.restart and not os.path.exists(equil_state_path):
+        logging.error("Cannot find equilibrated state. Please run --equilibrate first, or use --restart.")
+        sys.exit(1)
+
+    logging.info(f"Loading topology from {equil_pdb_path}")
+    pdb = PDBFile(equil_pdb_path)
+    topology = pdb.topology
+
+    logging.info(f"Loading system from {equil_system_path}")
+    with open(equil_system_path, "r") as f:
+        system_xml_string = f.read()
+
+    platform = select_platform()
+    dt_ps = args.timestep_fs / 1000.0
+    temperature = 300 * kelvin
+
+    production_steps = int(args.prod_ns * 1000 / dt_ps)
+    report_interval_ps = 50
+    report_interval = int(report_interval_ps / dt_ps)
+    checkpoint_interval_ps = 100000.0
+    checkpoint_interval = int(checkpoint_interval_ps / dt_ps)
+
+    exchange_interval_ps = args.bias_exchange.get("exchange_interval_ps", 2.0)
+    exchange_interval = max(1, round(exchange_interval_ps / dt_ps))
+
+    walkers = build_bias_exchange_walkers(args, topology, system_xml_string, temperature, dt_ps, platform)
+
+    for walker in walkers:
+        dcd_path = os.path.join(walker.output_dir, "production.dcd")
+        log_path = os.path.join(walker.output_dir, "production.csv")
+        metad_cv_path = os.path.join(walker.output_dir, "metad_cv.csv")
+
+        total_steps_for_reporter = walker.simulation.currentStep + production_steps
+
+        walker.simulation.reporters.append(DCDReporter(dcd_path, report_interval))
+        walker.simulation.reporters.append(
+            StateDataReporter(
+                log_path,
+                report_interval,
+                step=True,
+                time=True,
+                potentialEnergy=True,
+                temperature=True,
+                density=True,
+                progress=True,
+                remainingTime=True,
+                speed=True,
+                totalSteps=total_steps_for_reporter,
+                separator=",",
+            )
+        )
+        walker.simulation.reporters.append(CheckpointReporter(walker.checkpoint_path, checkpoint_interval))
+        walker.simulation.reporters.append(LoggingReporter())
+        walker.simulation.reporters.append(
+            MetadynamicsCVReporter(walker.meta, walker.cv_labels, metad_cv_path, report_interval)
+        )
+
+    exchange_log_path = os.path.join(args.output_dir, "bias_exchange_log.csv")
+    with open(exchange_log_path, "w") as f:
+        f.write("cycle,step,walker_i,walker_j,delta,accepted\n")
+
+    logging.info(
+        f"Starting {args.prod_ns} ns bias-exchange production with {len(walkers)} walkers "
+        f"({production_steps} steps, exchange every {exchange_interval} steps)..."
+    )
+
+    steps_done = 0
+    cycle = 0
+
+    while steps_done < production_steps:
+        steps_this_cycle = min(exchange_interval, production_steps - steps_done)
+
+        for walker in walkers:
+            walker.meta.step(walker.simulation, steps_this_cycle)
+
+        steps_done += steps_this_cycle
+
+        offset = cycle % 2
+        pairs = [(i, i + 1) for i in range(offset, len(walkers) - 1, 2)]
+
+        with open(exchange_log_path, "a") as f:
+            for i, j in pairs:
+                accepted, delta = attempt_exchange(walkers[i], walkers[j], temperature)
+                f.write(f"{cycle},{steps_done},{i},{j},{delta:.4f},{int(accepted)}\n")
+                logging.info(f"Exchange attempt cycle={cycle} walkers=({i},{j}) delta={delta:.3f} accepted={accepted}")
+
+        cycle += 1
+
+    for walker in walkers:
+        logging.info(f"Walker {walker.index}: saving final checkpoint to {walker.final_checkpoint_path}")
+        walker.simulation.saveCheckpoint(walker.final_checkpoint_path)
+
+        free_energy_path = os.path.join(walker.output_dir, "metad_free_energy.npy")
+        axes_path = os.path.join(walker.output_dir, "metad_free_energy_axes.json")
+
+        np.save(free_energy_path, walker.meta.getFreeEnergy().value_in_unit(kilojoules_per_mole))
+
+        with open(axes_path, "w") as f:
+            json.dump(
+                [
+                    {
+                        "label": label,
+                        "min_degrees": math.degrees(variable.minValue),
+                        "max_degrees": math.degrees(variable.maxValue),
+                        "grid_width": variable.gridWidth,
+                    }
+                    for label, variable in zip(walker.cv_labels, walker.meta.variables)
+                ],
+                f,
+                indent=2,
+            )
+
+        logging.info(f"Walker {walker.index}: saved free energy surface to {free_energy_path} (axes: {axes_path})")
+
+    logging.info("--- PRODUCTION STAGE COMPLETE (BIAS-EXCHANGE METADYNAMICS) ---")
+
+
 def run_production(args: argparse.Namespace) -> None:
     logging.info("--- STAGE 3: PRODUCTION MD ---")
 
@@ -2231,6 +2809,16 @@ def run_production(args: argparse.Namespace) -> None:
         system = XmlSerializer.deserialize(f.read())
 
     platform = select_platform()
+    dt_ps = args.timestep_fs / 1000.0
+
+    meta = None
+    cv_labels = []
+
+    if args.metadynamics and args.metadynamics.get("enabled"):
+        metad_config = dict(args.metadynamics)
+        metad_config["_bias_dir"] = os.path.join(args.output_dir, metad_config.get("bias_dir", "metad_bias"))
+        meta, cv_labels, _cv_atoms = build_metadynamics(system, topology, metad_config, 300 * kelvin, dt_ps)
+
     integrator = LangevinMiddleIntegrator(300 * kelvin, 1 / picosecond, args.timestep_fs * femtoseconds)
     simulation = Simulation(topology, system, integrator, platform)
 
@@ -2256,7 +2844,6 @@ def run_production(args: argparse.Namespace) -> None:
     dcd_path = os.path.join(args.output_dir, "production.dcd")
     log_path = os.path.join(args.output_dir, "production.csv")
 
-    dt_ps = integrator.getStepSize().value_in_unit(picoseconds)
     report_interval_ps = 50
     report_interval = int(report_interval_ps / dt_ps)
     production_steps = int(args.prod_ns * 1000 / dt_ps)
@@ -2286,11 +2873,42 @@ def run_production(args: argparse.Namespace) -> None:
     simulation.reporters.append(CheckpointReporter(checkpoint_path, checkpoint_interval))
     simulation.reporters.append(LoggingReporter())
 
+    if meta is not None:
+        metad_cv_path = os.path.join(args.output_dir, "metad_cv.csv")
+        simulation.reporters.append(MetadynamicsCVReporter(meta, cv_labels, metad_cv_path, report_interval))
+
     logging.info(f"Starting {args.prod_ns} ns production run ({production_steps} steps)...")
-    simulation.step(production_steps)
+
+    if meta is not None:
+        meta.step(simulation, production_steps)
+    else:
+        simulation.step(production_steps)
 
     logging.info(f"Saving final checkpoint to {final_checkpoint_path}")
     simulation.saveCheckpoint(final_checkpoint_path)
+
+    if meta is not None:
+        free_energy_path = os.path.join(args.output_dir, "metad_free_energy.npy")
+        axes_path = os.path.join(args.output_dir, "metad_free_energy_axes.json")
+
+        np.save(free_energy_path, meta.getFreeEnergy().value_in_unit(kilojoules_per_mole))
+
+        with open(axes_path, "w") as f:
+            json.dump(
+                [
+                    {
+                        "label": label,
+                        "min_degrees": math.degrees(variable.minValue),
+                        "max_degrees": math.degrees(variable.maxValue),
+                        "grid_width": variable.gridWidth,
+                    }
+                    for label, variable in zip(cv_labels, meta.variables)
+                ],
+                f,
+                indent=2,
+            )
+
+        logging.info(f"Saved metadynamics free energy surface to {free_energy_path} (axes: {axes_path})")
 
     logging.info("--- PRODUCTION STAGE COMPLETE ---")
 
@@ -2340,6 +2958,33 @@ def main() -> None:
     )
 
     parser.add_argument("--prod_ns", type=float, default=1.0, help="Length of production run in nanoseconds.")
+
+    parser.add_argument(
+        "--metadynamics",
+        type=json.loads,
+        default=None,
+        help=(
+            "JSON object configuring well-tempered metadynamics torsion biasing during the "
+            "production stage, e.g. "
+            '\'{"enabled": true, "cvs": [{"type": "phi", "chain": "A", "residue": 45}]}\'. '
+            "Normally supplied via --config."
+        ),
+    )
+
+    parser.add_argument(
+        "--bias_exchange",
+        type=json.loads,
+        default=None,
+        help=(
+            "JSON object configuring bias-exchange metadynamics during the production stage: "
+            "multiple walkers, each biasing its own torsion CV(s), periodically swapping "
+            "configurations. Mutually exclusive with --metadynamics. Example: "
+            '\'{"enabled": true, "exchange_interval_ps": 2.0, "walkers": '
+            '[{"cvs": [{"type": "phi", "chain": "A", "residue": 45}]}, '
+            '{"cvs": [{"type": "psi", "chain": "A", "residue": 45}]}]}\'. '
+            "Normally supplied via --config."
+        ),
+    )
 
     parser.add_argument(
         "--lig_ff",
@@ -2610,7 +3255,10 @@ def main() -> None:
         run_equilibrate(args)
 
     if args.produce:
-        run_production(args)
+        if args.bias_exchange and args.bias_exchange.get("enabled"):
+            run_production_bias_exchange(args)
+        else:
+            run_production(args)
 
     logging.info("All defined steps completed.")
 

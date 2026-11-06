@@ -1,0 +1,25 @@
+{
+  "receptor": "inputs/protein.pdb",
+  "output_dir": "runs/bias_exchange_metadynamics",
+  "prepare": true,
+  "equilibrate": true,
+  "produce": true,
+  "ph": 7.4,
+  "metal_aware_protonation": true,
+  "metal_coordination_restraints": false,
+  "metal_coordination_cutoff": 3.0,
+  "metal_coordination_k": 50000.0,
+  "water_model": "tip3p",
+  "timestep_fs": 4.0,
+  "hydrogen_mass": 1.5,
+  "prod_ns": 100.0,
+  "bias_exchange": {
+    "enabled": true,
+    "exchange_interval_ps": 2.0,
+    "walkers": [
+      {"cvs": [{"type": "phi", "chain": "A", "residue": 45, "bias_width_degrees": 25}]},
+      {"cvs": [{"type": "psi", "chain": "A", "residue": 45, "bias_width_degrees": 25}]},
+      {"cvs": [{"type": "phi", "chain": "A", "residue": 47, "bias_width_degrees": 25}]}
+    ]
+  }
+}
