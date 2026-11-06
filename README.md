@@ -52,7 +52,9 @@ examples/ncaa_work/                            Example NCAA intermediate files
 
 3. `produce`
    - Loads the equilibrated system/state.
-   - Runs production MD.
+   - Runs production MD, optionally with enhanced sampling (see
+     [Enhanced Sampling](#enhanced-sampling) below): well-tempered metadynamics, bias-exchange
+     metadynamics, or automated CDR-loop bias-exchange for antibody Fabs.
    - Writes `production.dcd`, `production.csv`, `production.chk`, and `production_final.chk`.
    - Supports restart from the newest production checkpoint with `--restart`.
 
@@ -72,6 +74,12 @@ conda install -c conda-forge openff-toolkit rdkit openmmforcefields
 ```
 
 For contact analysis, install `getcontacts` separately and either put its commands on `PATH` or set `getcontacts.path` in `analysis/contact.json`.
+
+For automated CDR-loop detection on antibody Fabs (see [Enhanced Sampling](#enhanced-sampling)), also install `anarcii`:
+
+```bash
+pip install anarcii
+```
 
 ## Quick Start
 
@@ -143,6 +151,10 @@ Common fields:
 - `metal_coordination_restraints`: optional harmonic restraints between retained metals and nearby N/O/S donor atoms.
 - `metal_coordination_cutoff`: metal-donor detection cutoff in Angstrom.
 - `metal_coordination_k`: restraint force constant in kJ/mol/nm^2.
+- `platform`: optional OpenMM platform name (`CUDA`, `OpenCL`, `CPU`, `Reference`). Defaults to
+  auto-detecting the fastest usable platform; override this if auto-detection picks a platform
+  that is compiled in but not actually usable on a given machine (seen in practice with some
+  OpenCL driver setups that work for a trivial system but fail on a real solvated one).
 
 ## Protein-Ligand Systems
 
@@ -172,6 +184,96 @@ For metalloprotein or metal-coordinated ligand systems, use a config such as
 `examples/10_metal_coordinated_protein_ligand.json`. Metal-aware protonation is
 enabled by default, and that example also enables harmonic metal coordination
 restraints.
+
+## Enhanced Sampling
+
+The production stage supports three mutually exclusive enhanced-sampling modes on top of
+plain MD, all built on OpenMM's `openmm.app.metadynamics` and all biasing backbone phi/psi
+torsions. Each is configured with its own top-level JSON key; omit all three for plain MD.
+
+### Well-tempered metadynamics
+
+Bias 1-3 backbone torsions in a single walker. Useful for accelerating sampling of a specific
+known loop or side-chain-adjacent backbone motion.
+
+```json
+"metadynamics": {
+  "enabled": true,
+  "cvs": [
+    {"type": "phi", "chain": "A", "residue": 45, "bias_width_degrees": 25},
+    {"type": "psi", "chain": "A", "residue": 45, "bias_width_degrees": 25}
+  ],
+  "bias_factor": 10.0,
+  "height_kjmol": 1.2,
+  "deposition_interval_ps": 1.0,
+  "save_interval_ps": 100.0
+}
+```
+
+```bash
+python mojoeMD.py -c examples/12_metadynamics_phi_psi.json
+```
+
+Outputs per run: `metad_bias/` (bias checkpoints, also used to resume with `--restart`),
+`metad_cv.csv` (CV trajectory in degrees), `metad_free_energy.npy` + `metad_free_energy_axes.json`
+(free-energy surface, written at the end of the run).
+
+### Bias-exchange metadynamics (BE-META)
+
+Run several walkers in one process, each biasing its own set of torsions (any number per
+walker — more than 3 automatically splits into multiple internal bias groups), periodically
+attempting Metropolis-criterion swaps of full configurations between walkers. Useful when you
+want several CVs explored in parallel without forcing them into one shared bias.
+
+```json
+"bias_exchange": {
+  "enabled": true,
+  "exchange_interval_ps": 2.0,
+  "walkers": [
+    {"cvs": [{"type": "phi", "chain": "A", "residue": 45, "bias_width_degrees": 25}]},
+    {"cvs": [{"type": "psi", "chain": "A", "residue": 45, "bias_width_degrees": 25}]}
+  ]
+}
+```
+
+```bash
+python mojoeMD.py -c examples/13_bias_exchange_metadynamics.json
+```
+
+Outputs per run: one subdirectory per walker (`walker_00/`, `walker_01/`, ... or a custom
+label), each with its own `production.dcd`/`.csv`/checkpoints, `metad_bias/`, `metad_cv.csv`,
+and per-bias-group free-energy files; plus a top-level `bias_exchange_log.csv` recording every
+exchange attempt (Δ and accept/reject) for monitoring exchange acceptance rates.
+
+### Automated CDR-loop bias-exchange for antibody Fabs
+
+For an antibody Fab or similar, automatically detects the CDR loop residues with
+[`anarcii`](https://github.com/oxpig/ANARCII) (antibody numbering, no manual residue picking
+required) and runs one bias-exchange walker per CDR loop, biasing every backbone phi/psi
+torsion in that loop together. Heavy/light chain identity is auto-detected from sequence by
+`anarcii`, not assumed from the input PDB's own chain IDs — useful since those can be
+mislabeled or inconsistent across deposited structures.
+
+```json
+"auto_cdr_bias_exchange": {
+  "enabled": true,
+  "loops": ["H1", "H2", "H3", "L1", "L2", "L3"],
+  "bias_width_degrees": 25,
+  "bias_factor": 10.0,
+  "exchange_interval_ps": 2.0
+}
+```
+
+```bash
+python mojoeMD.py -c examples/14_auto_cdr_bias_exchange_fab.json
+```
+
+`loops` defaults to all six CDRs (`H1`/`H2`/`H3`/`L1`/`L2`/`L3`, IMGT-numbered) and can be
+restricted to a subset, e.g. `["H3"]` for just the heavy-chain CDR3 loop. Each requested loop
+becomes one walker labeled `CDR-H1`, `CDR-H2`, etc., with its own output subdirectory, following
+the same bias-exchange output layout described above. CDR residue detection runs once at the
+start of production and is logged (loop name, number of residues, number of torsions biased);
+a loop with no detected residues is skipped with a warning rather than failing the run.
 
 ## Membrane Systems
 
@@ -473,6 +575,10 @@ The energy calculation is a lightweight Coulomb + Lennard-Jones screen. It is us
 - Production reports DCD frames every 50 ps.
 - Production checkpointing is configured at a long interval; final checkpoint is always written at the end of a successful run.
 - GPU platforms use mixed precision, and CUDA sets deterministic forces by default.
+- `metadynamics`, `bias_exchange`, and `auto_cdr_bias_exchange` are mutually exclusive; enabling
+  more than one of them fails validation before any stage runs.
+- Bias-exchange and auto-CDR bias-exchange run every walker sequentially in one process (no
+  MPI/multi-process support), so wall-clock time scales with the number of walkers.
 
 ## Development Check
 
