@@ -4,6 +4,7 @@
   "prepare": true,
   "equilibrate": true,
   "produce": true,
+  "gpu_ids": [0, 1, 2],
   "ph": 7.4,
   "metal_aware_protonation": true,
   "metal_coordination_restraints": false,

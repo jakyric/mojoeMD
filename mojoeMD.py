@@ -59,37 +59,48 @@ from openmm.unit import (
 )
 from tqdm import tqdm
 
-try:
-    from openmmtools.utils import get_fastest_platform
-except ImportError:
-    def get_fastest_platform() -> Platform:
-        from openmm import System, VerletIntegrator, Context
-        from openmm.unit import picoseconds
+def get_fastest_platform() -> Platform:
+    """Pick the most capable usable OpenMM platform, preferring CUDA over OpenCL over CPU.
 
-        preferred = ["CUDA", "OpenCL", "CPU", "Reference"]
-        available = {
-            Platform.getPlatform(i).getName(): Platform.getPlatform(i)
-            for i in range(Platform.getNumPlatforms())
-        }
+    openmmtools.utils.get_fastest_platform() ranks platforms by Platform.getSpeed(), a static
+    benchmark score that does not verify a platform actually works on this machine. That can
+    pick OpenCL over CUDA on a machine whose CUDA plugin is compiled in but fails to load or
+    initialize (e.g. a driver/toolkit too old for a new GPU architecture such as Blackwell), with
+    no visible error. We verify each candidate with a throwaway Context instead, and surface any
+    plugin load failures so a CUDA problem is diagnosable rather than silently masked by OpenCL.
+    """
+    from openmm import System, VerletIntegrator, Context
+    from openmm.unit import picoseconds
 
-        for name in preferred:
-            platform = available.get(name)
-            if platform is None:
-                continue
+    failures = Platform.getPluginLoadFailures()
+    if failures:
+        logging.warning("Some OpenMM platform plugins failed to load:\n" + "\n".join(failures))
 
-            # A platform can be compiled in but not actually usable (e.g. no working OpenCL
-            # driver/device), so verify it by creating a throwaway Context rather than trusting
-            # Platform.getNumPlatforms() alone.
-            try:
-                test_system = System()
-                test_system.addParticle(1.0)
-                Context(test_system, VerletIntegrator(1.0 * picoseconds), platform)
-            except Exception:
-                continue
+    preferred = ["CUDA", "OpenCL", "CPU", "Reference"]
+    available = {
+        Platform.getPlatform(i).getName(): Platform.getPlatform(i)
+        for i in range(Platform.getNumPlatforms())
+    }
 
-            return platform
+    for name in preferred:
+        platform = available.get(name)
+        if platform is None:
+            continue
 
-        raise RuntimeError("No usable OpenMM platform is available.")
+        # A platform can be compiled in but not actually usable (e.g. no working CUDA/OpenCL
+        # driver/device), so verify it by creating a throwaway Context rather than trusting
+        # Platform.getNumPlatforms() alone.
+        try:
+            test_system = System()
+            test_system.addParticle(1.0)
+            Context(test_system, VerletIntegrator(1.0 * picoseconds), platform)
+        except Exception as exc:
+            logging.warning(f"Platform '{name}' is compiled in but not usable on this machine ({exc}); skipping it.")
+            continue
+
+        return platform
+
+    raise RuntimeError("No usable OpenMM platform is available.")
 
 def _find_spec_safe(name: str):
     # importlib.util.find_spec raises ModuleNotFoundError (instead of returning None) for a
@@ -463,6 +474,23 @@ def validate_auto_cdr_bias_exchange_config(auto_cfg: dict) -> bool:
     return True
 
 
+def _parse_gpu_ids(value: str | list) -> list[int]:
+    """Parse --gpu_ids / the JSON config's "gpu_ids" into a list of ints.
+
+    Accepts a CLI string like "0,1,2", or a value already loaded as a list (e.g. from JSON
+    config, which bypasses argparse's `type=` conversion).
+    """
+    if isinstance(value, list):
+        return [int(v) for v in value]
+
+    try:
+        return [int(v.strip()) for v in value.split(",") if v.strip() != ""]
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"Invalid --gpu_ids value: {value!r}; expected comma-separated integers, e.g. '0,1,2'."
+        )
+
+
 def select_platform(platform_name: str | None = None) -> Platform:
     if platform_name is None or platform_name.lower() == "fastest":
         platform = get_fastest_platform()
@@ -477,6 +505,33 @@ def select_platform(platform_name: str | None = None) -> Platform:
             platform.setPropertyDefaultValue("DeterministicForces", "true")
 
     return platform
+
+
+def platform_properties_for_simulation(
+    platform: Platform,
+    gpu_ids: list[int] | None,
+    walker_index: int | None = None,
+) -> dict[str, str] | None:
+    """Build the per-Simulation platformProperties that assign GPU device(s), if requested.
+
+    `gpu_ids` is the (possibly flexible/partial) set of GPU device indices the user has made
+    available, e.g. [0, 1, 2] on a 4-GPU machine to deliberately leave GPU 3 free.
+
+    - walker_index is None (a single simulation, e.g. equilibration or plain production): every
+      id in gpu_ids is handed to the platform as one comma-separated DeviceIndex list, letting
+      OpenMM's native multi-GPU support split that single context across all of them.
+    - walker_index is given (one simulation per bias-exchange walker): that walker round-robins
+      onto a single entry of gpu_ids, so N walkers spread evenly across len(gpu_ids) GPUs.
+    """
+    if platform.getName() not in ("CUDA", "OpenCL") or not gpu_ids:
+        return None
+
+    if walker_index is None:
+        device_index = ",".join(str(g) for g in gpu_ids)
+    else:
+        device_index = str(gpu_ids[walker_index % len(gpu_ids)])
+
+    return {"DeviceIndex": device_index}
 
 
 class LoggingReporter:
@@ -2276,8 +2331,9 @@ def run_equilibrate(args: argparse.Namespace) -> None:
         system = XmlSerializer.deserialize(f.read())
 
     platform = select_platform(args.platform)
+    platform_properties = platform_properties_for_simulation(platform, args.gpu_ids)
     integrator = LangevinMiddleIntegrator(300 * kelvin, 1 / picosecond, args.timestep_fs * femtoseconds)
-    simulation = Simulation(topology, system, integrator, platform)
+    simulation = Simulation(topology, system, integrator, platform, platform_properties)
     simulation.context.setPositions(positions)
 
     logging.info("Running energy minimization...")
@@ -2931,6 +2987,12 @@ def build_bias_exchange_walkers(
     walker_labels = args.bias_exchange.get("_walker_labels")
     walkers = []
 
+    if args.gpu_ids:
+        logging.info(
+            f"Distributing {len(args.bias_exchange['walkers'])} bias-exchange walker(s) round-robin "
+            f"across GPU device(s) {args.gpu_ids}."
+        )
+
     for i, walker_cfg in enumerate(args.bias_exchange["walkers"]):
         label = walker_labels[i] if walker_labels else f"walker_{i:02d}"
         walker_dir = os.path.join(args.output_dir, label)
@@ -2944,7 +3006,10 @@ def build_bias_exchange_walkers(
         groups = build_metadynamics_groups(system, topology, metad_config, temperature, dt_ps, bias_dir)
 
         integrator = LangevinMiddleIntegrator(temperature, 1 / picosecond, args.timestep_fs * femtoseconds)
-        simulation = Simulation(topology, system, integrator, platform)
+        platform_properties = platform_properties_for_simulation(platform, args.gpu_ids, walker_index=i)
+        if platform_properties:
+            logging.info(f"Walker {label}: assigned to GPU device {platform_properties['DeviceIndex']}.")
+        simulation = Simulation(topology, system, integrator, platform, platform_properties)
 
         checkpoint_path = os.path.join(walker_dir, "production.chk")
         final_checkpoint_path = os.path.join(walker_dir, "production_final.chk")
@@ -3148,7 +3213,8 @@ def run_production(args: argparse.Namespace) -> None:
         meta, cv_labels, _cv_atoms = build_metadynamics(system, topology, metad_config, 300 * kelvin, dt_ps)
 
     integrator = LangevinMiddleIntegrator(300 * kelvin, 1 / picosecond, args.timestep_fs * femtoseconds)
-    simulation = Simulation(topology, system, integrator, platform)
+    platform_properties = platform_properties_for_simulation(platform, args.gpu_ids)
+    simulation = Simulation(topology, system, integrator, platform, platform_properties)
 
     if args.restart:
         restart_candidates = [p for p in [final_checkpoint_path, checkpoint_path] if os.path.exists(p)]
@@ -3283,6 +3349,21 @@ def main() -> None:
             "Reference). Defaults to auto-detecting the fastest usable platform. Override this "
             "if auto-detection picks a platform that is compiled in but not actually usable on "
             "this machine (a known issue with some OpenCL driver setups)."
+        ),
+    )
+
+    parser.add_argument(
+        "--gpu_ids",
+        type=_parse_gpu_ids,
+        default=None,
+        metavar="IDS",
+        help=(
+            "Comma-separated GPU device indices to use on a CUDA/OpenCL platform, e.g. '0,1,2' "
+            "to use 3 of a 4-GPU machine and deliberately leave one free. For a bias-exchange run "
+            "(--bias_exchange/--auto_cdr_bias_exchange), each walker round-robins onto one of "
+            "these devices, spreading walkers across the listed GPUs. For a single simulation "
+            "(plain --equilibrate/--produce), all listed devices are handed to OpenMM as one "
+            "multi-GPU context. Defaults to the platform's own default device."
         ),
     )
 

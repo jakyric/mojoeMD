@@ -154,7 +154,18 @@ Common fields:
 - `platform`: optional OpenMM platform name (`CUDA`, `OpenCL`, `CPU`, `Reference`). Defaults to
   auto-detecting the fastest usable platform; override this if auto-detection picks a platform
   that is compiled in but not actually usable on a given machine (seen in practice with some
-  OpenCL driver setups that work for a trivial system but fail on a real solvated one).
+  OpenCL driver setups that work for a trivial system but fail on a real solvated one). Platform
+  detection verifies each candidate with a throwaway `Context` rather than trusting a static
+  benchmark score, and logs any OpenMM plugin load failures (e.g. a CUDA plugin that fails to
+  load because the driver/toolkit is too old for a newer GPU architecture) so a broken CUDA setup
+  is diagnosable instead of being silently masked by a fallback to OpenCL.
+- `gpu_ids`: optional list of GPU device indices to use on a CUDA/OpenCL platform, e.g. `[0, 1,
+  2]` to use 3 of a 4-GPU machine and deliberately leave one free (also settable with
+  `--gpu_ids 0,1,2` on the command line). For a bias-exchange run (`bias_exchange` /
+  `auto_cdr_bias_exchange`), each walker round-robins onto one of these devices, so N walkers
+  spread evenly across the listed GPUs. For a single simulation (plain `equilibrate`/`produce`),
+  all listed devices are handed to OpenMM as one multi-GPU context. Defaults to the platform's
+  own default device (normally device 0).
 
 ## Protein-Ligand Systems
 
@@ -274,6 +285,10 @@ becomes one walker labeled `CDR-H1`, `CDR-H2`, etc., with its own output subdire
 the same bias-exchange output layout described above. CDR residue detection runs once at the
 start of production and is logged (loop name, number of residues, number of torsions biased);
 a loop with no detected residues is skipped with a warning rather than failing the run.
+
+On a multi-GPU machine, set `gpu_ids` to spread the walkers across devices, e.g. `[0, 1, 2]` to
+use 3 of a 4-GPU box and leave GPU 3 free; with six CDR-loop walkers that puts two walkers on
+each GPU, round-robin. See [`gpu_ids`](#example-simulation-config) above.
 
 ## Membrane Systems
 
