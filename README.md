@@ -162,10 +162,11 @@ Common fields:
 - `gpu_ids`: optional list of GPU device indices to use on a CUDA/OpenCL platform, e.g. `[0, 1,
   2]` to use 3 of a 4-GPU machine and deliberately leave one free (also settable with
   `--gpu_ids 0,1,2` on the command line). For a bias-exchange run (`bias_exchange` /
-  `auto_cdr_bias_exchange`), each walker round-robins onto one of these devices, so N walkers
-  spread evenly across the listed GPUs. For a single simulation (plain `equilibrate`/`produce`),
-  all listed devices are handed to OpenMM as one multi-GPU context. Defaults to the platform's
-  own default device (normally device 0).
+  `auto_cdr_bias_exchange`), each walker round-robins onto one of these devices and the walkers
+  are stepped concurrently, so N walkers spread evenly across the listed GPUs. A single
+  simulation (`equilibrate`, plain `produce`) uses only the first listed device. The indices are
+  the ones CUDA sees: if `CUDA_VISIBLE_DEVICES=0,1,3` is set, the three visible GPUs are `0,1,2`.
+  Defaults to the platform's own default device (normally device 0).
 
 ## Protein-Ligand Systems
 
@@ -283,7 +284,8 @@ useful since those can be mislabeled or inconsistent across deposited structures
   "loops": ["H1", "H2", "H3", "L1", "L2", "L3"],
   "cv_style": "combined_psi_sincos",
   "bias_factor": 10.0,
-  "height_kjmol": 41.84,
+  "height_kjmol": 10.0,
+  "combined_cv_bias_width": 0.3,
   "deposition_interval_ps": 2.0,
   "exchange_interval_ps": 2.0
 }
@@ -305,7 +307,12 @@ are reported in raw (unitless) values rather than degrees, since the combined CV
 
 On a multi-GPU machine, set `gpu_ids` to spread the walkers across devices, e.g. `[0, 1, 2]` to
 use 3 of a 4-GPU box and leave GPU 3 free; with six CDR-loop walkers that puts two walkers on
-each GPU, round-robin. See [`gpu_ids`](#example-simulation-config) above.
+each GPU, round-robin, all running concurrently. See [`gpu_ids`](#example-simulation-config)
+above.
+
+Starting a fresh run (no `--restart`) in an output directory that already holds metadynamics
+bias files moves the old `metad_bias` directory aside to `metad_bias.stale_<timestamp>`, so the
+new run starts from zero bias. With `--restart`, the existing bias is loaded and continued.
 
 #### Matching Fernandez-Quintero et al.'s published protocol
 
@@ -315,9 +322,10 @@ OpenMM-based pipeline can:
 
 | Parameter | Literature value | This pipeline |
 | --- | --- | --- |
-| CV | sum of sin(psi)+cos(psi) per loop | `cv_style: "combined_psi_sincos"` |
+| CV | linear combination of sin(psi) and cos(psi) per loop (PLUMED MATHEVAL + COMBINE) | `cv_style: "combined_psi_sincos"`: unweighted sum, which is COMBINE's default (coefficients 1, powers 1, no normalization) |
 | Walkers | one per CDR loop, bias-exchange | `loops` (default: all six) |
-| Gaussian height | 10.0 kcal/mol | `height_kjmol: 41.84` (= 10.0 kcal/mol) |
+| Gaussian height | 10 kJ/mol (some of the papers print 10 kcal/mol) | `height_kjmol: 10.0` |
+| Gaussian width | 0.3 rad | `combined_cv_bias_width: 0.3` (also the default) |
 | Bias factor | 10 | `bias_factor: 10.0` |
 | Deposition stride | every 1000 steps (~2 ps at their ~2 fs timestep) | `deposition_interval_ps: 2.0` |
 | Simulation length | 200 ns bias-exchange metadynamics per structure | `prod_ns: 200.0` |
@@ -328,12 +336,11 @@ OpenMM-based pipeline can:
 A few things this pipeline does **not** reproduce exactly, because they're specific to the
 AMBER/MOE toolchain the papers used rather than to the sampling method itself:
 
-- **Gaussian width (sigma):** not disclosed in the papers' methods sections. `cv_style:
-  "combined_psi_sincos"` defaults to `0.3 * sqrt(number of residues in the loop)`, a heuristic,
-  not a literature value; override with `combined_cv_bias_width` in `auto_cdr_bias_exchange` if
-  you have a better estimate for your system.
+- **CV coefficients:** the papers do not publish their PLUMED input, so the unweighted sum is an
+  assumption based on COMBINE's defaults.
 - **Exchange attempt interval:** not stated in the papers; this pipeline keeps its own default
-  (`exchange_interval_ps: 2.0`), adjustable the same way.
+  (`exchange_interval_ps: 2.0`). Each cycle, walkers are paired at random and each pair attempts
+  one swap.
 - **Charge neutralization:** the papers use AMBER/sander's uniform background charge; this
   OpenMM-based pipeline neutralizes with explicit ions (`ionic_strength`) instead, since PME in
   OpenMM requires a net-neutral unit cell built that way.

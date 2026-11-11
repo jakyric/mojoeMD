@@ -12,6 +12,7 @@ import random
 import sys
 import time
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 import importlib.util
 from dataclasses import dataclass
 from pathlib import Path
@@ -533,9 +534,8 @@ def platform_properties_for_simulation(
     `gpu_ids` is the (possibly flexible/partial) set of GPU device indices the user has made
     available, e.g. [0, 1, 2] on a 4-GPU machine to deliberately leave GPU 3 free.
 
-    - walker_index is None (a single simulation, e.g. equilibration or plain production): every
-      id in gpu_ids is handed to the platform as one comma-separated DeviceIndex list, letting
-      OpenMM's native multi-GPU support split that single context across all of them.
+    - walker_index is None (a single simulation, e.g. equilibration or plain production): the
+      first id in gpu_ids is used. Splitting one context of this size across GPUs is not faster.
     - walker_index is given (one simulation per bias-exchange walker): that walker round-robins
       onto a single entry of gpu_ids, so N walkers spread evenly across len(gpu_ids) GPUs.
     """
@@ -543,7 +543,7 @@ def platform_properties_for_simulation(
         return None
 
     if walker_index is None:
-        device_index = ",".join(str(g) for g in gpu_ids)
+        device_index = str(gpu_ids[0])
     else:
         device_index = str(gpu_ids[walker_index % len(gpu_ids)])
 
@@ -2513,6 +2513,31 @@ def resolve_phi_psi_atoms(
     return matches[0][1]
 
 
+def set_aside_stale_bias_dir(bias_dir: str, restart: bool) -> None:
+    """On a fresh (non-restart) run, move any existing bias directory out of the way.
+
+    OpenMM's Metadynamics loads every bias_*.npy it finds in its biasDir, so leftovers from an
+    earlier run would silently be added to a new run's bias (or crash it if the CVs changed).
+    """
+    if restart or not os.path.isdir(bias_dir):
+        return
+
+    has_bias_files = any(
+        name.startswith("bias_") and name.endswith(".npy")
+        for _root, _dirs, files in os.walk(bias_dir)
+        for name in files
+    )
+    if not has_bias_files:
+        return
+
+    backup = f"{bias_dir}.stale_{time.strftime('%Y%m%d_%H%M%S')}"
+    os.rename(bias_dir, backup)
+    logging.warning(
+        f"Found metadynamics bias files from an earlier run in {bias_dir}; moved them to {backup} "
+        "so this run starts from zero bias. Use --restart to continue an earlier run instead."
+    )
+
+
 def build_loop_psi_sincos_cv(
     topology: Topology,
     residues: list[tuple[str, str]],
@@ -2525,6 +2550,10 @@ def build_loop_psi_sincos_cv(
     10.3389/fimmu.2021.630034), where PLUMED's MATHEVAL/COMBINE reduce all of a loop's psi angles
     to one number so a single walker/replica can bias the whole loop with one 1-D CV, rather than
     biasing every torsion of the loop independently.
+
+    PLUMED's COMBINE computes sum_i c_i * (x_i - a_i)^p_i with defaults c_i=1, a_i=0, p_i=1 and
+    NORMALIZE off, so the unweighted sum used here is COMBINE's default. The papers do not
+    publish their input files, so non-default coefficients cannot be ruled out.
     """
     atom_quads = []
     for chain_id, residue_id in residues:
@@ -2569,7 +2598,7 @@ def build_metadynamics(
             n = len(atom_quads)
 
             bound = cv.get("bound", n * math.sqrt(2))
-            bias_width = cv.get("bias_width", 0.3 * math.sqrt(n))
+            bias_width = cv.get("bias_width", 0.3)
 
             variables.append(
                 BiasVariable(force, -bound, bound, bias_width, periodic=False, gridWidth=grid_width)
@@ -3066,6 +3095,26 @@ def step_bias_exchange_walker(walker: BiasExchangeWalker, steps: int) -> None:
         steps_to_go -= next_steps
 
 
+def step_walkers_concurrently(
+    walkers: list[BiasExchangeWalker], steps: int, executor: ThreadPoolExecutor
+) -> None:
+    """Advance every walker by `steps`, one thread per walker.
+
+    OpenMM releases the GIL while integrating, so walkers on different GPUs really do run at the
+    same time; a plain loop would leave all but one GPU idle.
+    """
+    futures = [executor.submit(step_bias_exchange_walker, walker, steps) for walker in walkers]
+    for future in futures:
+        future.result()
+
+
+def random_exchange_pairs(n_walkers: int) -> list[tuple[int, int]]:
+    """Disjoint random walker pairs. Bias-exchange walkers have no ladder, so any pair may swap."""
+    order = list(range(n_walkers))
+    random.shuffle(order)
+    return [tuple(sorted(order[k : k + 2])) for k in range(0, n_walkers - 1, 2)]
+
+
 def attempt_exchange(
     walker_i: BiasExchangeWalker,
     walker_j: BiasExchangeWalker,
@@ -3122,6 +3171,7 @@ def build_bias_exchange_walkers(
 
         metad_config = dict(walker_cfg)
         bias_dir = os.path.join(walker_dir, metad_config.get("bias_dir", "metad_bias"))
+        set_aside_stale_bias_dir(bias_dir, args.restart)
 
         groups = build_metadynamics_groups(system, topology, metad_config, temperature, dt_ps, bias_dir)
 
@@ -3247,27 +3297,24 @@ def run_production_bias_exchange(args: argparse.Namespace) -> None:
     steps_done = 0
     cycle = 0
 
-    while steps_done < production_steps:
-        steps_this_cycle = min(exchange_interval, production_steps - steps_done)
+    with ThreadPoolExecutor(max_workers=len(walkers)) as executor:
+        while steps_done < production_steps:
+            steps_this_cycle = min(exchange_interval, production_steps - steps_done)
 
-        for walker in walkers:
-            step_bias_exchange_walker(walker, steps_this_cycle)
+            step_walkers_concurrently(walkers, steps_this_cycle, executor)
 
-        steps_done += steps_this_cycle
+            steps_done += steps_this_cycle
 
-        offset = cycle % 2
-        pairs = [(i, i + 1) for i in range(offset, len(walkers) - 1, 2)]
+            with open(exchange_log_path, "a") as f:
+                for i, j in random_exchange_pairs(len(walkers)):
+                    accepted, delta = attempt_exchange(walkers[i], walkers[j], temperature)
+                    f.write(f"{cycle},{steps_done},{i},{j},{delta:.4f},{int(accepted)}\n")
+                    logging.info(
+                        f"Exchange attempt cycle={cycle} walkers=({walkers[i].label},{walkers[j].label}) "
+                        f"delta={delta:.3f} accepted={accepted}"
+                    )
 
-        with open(exchange_log_path, "a") as f:
-            for i, j in pairs:
-                accepted, delta = attempt_exchange(walkers[i], walkers[j], temperature)
-                f.write(f"{cycle},{steps_done},{i},{j},{delta:.4f},{int(accepted)}\n")
-                logging.info(
-                    f"Exchange attempt cycle={cycle} walkers=({walkers[i].label},{walkers[j].label}) "
-                    f"delta={delta:.3f} accepted={accepted}"
-                )
-
-        cycle += 1
+            cycle += 1
 
     for walker in walkers:
         logging.info(f"Walker {walker.label}: saving final checkpoint to {walker.final_checkpoint_path}")
@@ -3336,6 +3383,7 @@ def run_production(args: argparse.Namespace) -> None:
     if args.metadynamics and args.metadynamics.get("enabled"):
         metad_config = dict(args.metadynamics)
         metad_config["_bias_dir"] = os.path.join(args.output_dir, metad_config.get("bias_dir", "metad_bias"))
+        set_aside_stale_bias_dir(metad_config["_bias_dir"], args.restart)
         meta, cv_labels, _cv_atoms = build_metadynamics(system, topology, metad_config, 300 * kelvin, dt_ps)
 
     integrator = LangevinMiddleIntegrator(300 * kelvin, 1 / picosecond, args.timestep_fs * femtoseconds)
@@ -3493,9 +3541,9 @@ def main() -> None:
             "Comma-separated GPU device indices to use on a CUDA/OpenCL platform, e.g. '0,1,2' "
             "to use 3 of a 4-GPU machine and deliberately leave one free. For a bias-exchange run "
             "(--bias_exchange/--auto_cdr_bias_exchange), each walker round-robins onto one of "
-            "these devices, spreading walkers across the listed GPUs. For a single simulation "
-            "(plain --equilibrate/--produce), all listed devices are handed to OpenMM as one "
-            "multi-GPU context. Defaults to the platform's own default device."
+            "these devices and the walkers run concurrently. A single simulation "
+            "(--equilibrate, plain --produce) uses only the first listed device. Defaults to "
+            "the platform's own default device."
         ),
     )
 
