@@ -260,17 +260,31 @@ exchange attempt (Δ and accept/reject) for monitoring exchange acceptance rates
 
 For an antibody Fab or similar, automatically detects the CDR loop residues with
 [`anarcii`](https://github.com/oxpig/ANARCII) (antibody numbering, no manual residue picking
-required) and runs one bias-exchange walker per CDR loop, biasing every backbone phi/psi
-torsion in that loop together. Heavy/light chain identity is auto-detected from sequence by
-`anarcii`, not assumed from the input PDB's own chain IDs — useful since those can be
-mislabeled or inconsistent across deposited structures.
+required) and runs one bias-exchange walker per CDR loop. Heavy/light chain identity is
+auto-detected from sequence by `anarcii`, not assumed from the input PDB's own chain IDs —
+useful since those can be mislabeled or inconsistent across deposited structures.
+
+`cv_style` selects what each walker biases:
+
+- `"per_residue_torsions"` (default): bias every backbone phi/psi torsion of the loop
+  independently (one `BiasVariable` per torsion, chunked into groups of 3 per OpenMM's
+  `Metadynamics` limit).
+- `"combined_psi_sincos"`: bias one scalar CV per loop — the sum of sin(psi)+cos(psi) over every
+  residue's backbone psi torsion in that loop, reducing the whole loop to a single collective
+  variable via a `CustomCVForce`. This matches the CDR-loop CV used in Fernandez-Quintero et
+  al.'s bias-exchange metadynamics protocol for antibody CDR loops (e.g.
+  [10.1038/s42003-020-01319-z](https://doi.org/10.1038/s42003-020-01319-z),
+  [10.3389/fimmu.2021.630034](https://doi.org/10.3389/fimmu.2021.630034)), where PLUMED's
+  MATHEVAL/COMBINE reduce all of a loop's psi angles to one number.
 
 ```json
 "auto_cdr_bias_exchange": {
   "enabled": true,
   "loops": ["H1", "H2", "H3", "L1", "L2", "L3"],
-  "bias_width_degrees": 25,
+  "cv_style": "combined_psi_sincos",
   "bias_factor": 10.0,
+  "height_kjmol": 41.84,
+  "deposition_interval_ps": 2.0,
   "exchange_interval_ps": 2.0
 }
 ```
@@ -283,12 +297,50 @@ python mojoeMD.py -c examples/14_auto_cdr_bias_exchange_fab.json
 restricted to a subset, e.g. `["H3"]` for just the heavy-chain CDR3 loop. Each requested loop
 becomes one walker labeled `CDR-H1`, `CDR-H2`, etc., with its own output subdirectory, following
 the same bias-exchange output layout described above. CDR residue detection runs once at the
-start of production and is logged (loop name, number of residues, number of torsions biased);
-a loop with no detected residues is skipped with a warning rather than failing the run.
+start of production and is logged (loop name, number of residues, CV style); a loop with no
+detected residues is skipped with a warning rather than failing the run. With `cv_style:
+"combined_psi_sincos"`, the metadynamics CV CSV column and free-energy-axes JSON for that walker
+are reported in raw (unitless) values rather than degrees, since the combined CV isn't an angle;
+`"per_residue_torsions"` CVs are still reported in degrees as before.
 
 On a multi-GPU machine, set `gpu_ids` to spread the walkers across devices, e.g. `[0, 1, 2]` to
 use 3 of a 4-GPU box and leave GPU 3 free; with six CDR-loop walkers that puts two walkers on
 each GPU, round-robin. See [`gpu_ids`](#example-simulation-config) above.
+
+#### Matching Fernandez-Quintero et al.'s published protocol
+
+`examples/14_auto_cdr_bias_exchange_fab.json` is set up to match the enhanced-sampling parameters
+reported in Fernandez-Quintero et al.'s bias-exchange metadynamics papers as closely as this
+OpenMM-based pipeline can:
+
+| Parameter | Literature value | This pipeline |
+| --- | --- | --- |
+| CV | sum of sin(psi)+cos(psi) per loop | `cv_style: "combined_psi_sincos"` |
+| Walkers | one per CDR loop, bias-exchange | `loops` (default: all six) |
+| Gaussian height | 10.0 kcal/mol | `height_kjmol: 41.84` (= 10.0 kcal/mol) |
+| Bias factor | 10 | `bias_factor: 10.0` |
+| Deposition stride | every 1000 steps (~2 ps at their ~2 fs timestep) | `deposition_interval_ps: 2.0` |
+| Simulation length | 200 ns bias-exchange metadynamics per structure | `prod_ns: 200.0` |
+| Ensemble / temperature | NpT, 300 K | matches (default) |
+| Water model | TIP3P, 10 Å padding | matches (`water_model: tip3p`, default `solvent_padding: 1.0` nm) |
+| Protein force field | AMBER ff14SB | matches (`amber14/protein.ff14SB.xml`, hardcoded) |
+
+A few things this pipeline does **not** reproduce exactly, because they're specific to the
+AMBER/MOE toolchain the papers used rather than to the sampling method itself:
+
+- **Gaussian width (sigma):** not disclosed in the papers' methods sections. `cv_style:
+  "combined_psi_sincos"` defaults to `0.3 * sqrt(number of residues in the loop)`, a heuristic,
+  not a literature value; override with `combined_cv_bias_width` in `auto_cdr_bias_exchange` if
+  you have a better estimate for your system.
+- **Exchange attempt interval:** not stated in the papers; this pipeline keeps its own default
+  (`exchange_interval_ps: 2.0`), adjustable the same way.
+- **Charge neutralization:** the papers use AMBER/sander's uniform background charge; this
+  OpenMM-based pipeline neutralizes with explicit ions (`ionic_strength`) instead, since PME in
+  OpenMM requires a net-neutral unit cell built that way.
+- **C-terminal capping:** the papers cap every antibody fragment's C-terminus with an NME group
+  after deleting any bound antigen. This pipeline does not add caps automatically — if your input
+  PDB has free termini, either cap it yourself beforehand or treat the free termini as a known
+  deviation from the original protocol.
 
 ## Membrane Systems
 

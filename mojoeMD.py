@@ -22,6 +22,7 @@ import pdbfixer
 
 from openmm import (
     CustomBondForce,
+    CustomCVForce,
     CustomExternalForce,
     CustomTorsionForce,
     LangevinMiddleIntegrator,
@@ -417,8 +418,18 @@ def validate_cv_list(cvs: list[dict] | None, context_label: str) -> bool:
     ok = True
 
     for i, cv in enumerate(cvs):
-        if cv.get("type") not in ("phi", "psi"):
-            logging.error(f"{context_label}.cvs[{i}]: 'type' must be 'phi' or 'psi', got {cv.get('type')!r}.")
+        cv_type = cv.get("type")
+
+        if cv_type == "loop_psi_sincos":
+            if not cv.get("residues"):
+                logging.error(f"{context_label}.cvs[{i}]: 'loop_psi_sincos' requires a non-empty 'residues' list.")
+                ok = False
+            continue
+
+        if cv_type not in ("phi", "psi"):
+            logging.error(
+                f"{context_label}.cvs[{i}]: 'type' must be 'phi', 'psi', or 'loop_psi_sincos', got {cv_type!r}."
+            )
             ok = False
 
         if cv.get("residue") is None:
@@ -457,21 +468,26 @@ def validate_bias_exchange_config(bias_exchange_config: dict) -> bool:
 
 
 def validate_auto_cdr_bias_exchange_config(auto_cfg: dict) -> bool:
+    ok = True
+
     loops = auto_cfg.get("loops")
+    if loops is not None:
+        invalid = set(loops) - VALID_CDR_LOOP_NAMES
+        if invalid:
+            logging.error(
+                f"auto_cdr_bias_exchange.loops contains invalid loop name(s) {sorted(invalid)}; "
+                f"valid names are {sorted(VALID_CDR_LOOP_NAMES)}."
+            )
+            ok = False
 
-    if loops is None:
-        return True
-
-    invalid = set(loops) - VALID_CDR_LOOP_NAMES
-
-    if invalid:
+    cv_style = auto_cfg.get("cv_style")
+    if cv_style is not None and cv_style not in VALID_CDR_CV_STYLES:
         logging.error(
-            f"auto_cdr_bias_exchange.loops contains invalid loop name(s) {sorted(invalid)}; "
-            f"valid names are {sorted(VALID_CDR_LOOP_NAMES)}."
+            f"auto_cdr_bias_exchange.cv_style must be one of {sorted(VALID_CDR_CV_STYLES)}, got {cv_style!r}."
         )
-        return False
+        ok = False
 
-    return True
+    return ok
 
 
 def _parse_gpu_ids(value: str | list) -> list[int]:
@@ -2497,23 +2513,80 @@ def resolve_phi_psi_atoms(
     return matches[0][1]
 
 
+def build_loop_psi_sincos_cv(
+    topology: Topology,
+    residues: list[tuple[str, str]],
+) -> tuple[CustomCVForce, tuple[tuple[int, int, int, int], ...]]:
+    """Build one scalar CV biasing a whole CDR loop at once: the sum of sin(psi)+cos(psi) over
+    every residue's backbone psi torsion.
+
+    This matches the CDR-loop collective variable used in Fernandez-Quintero et al.'s
+    bias-exchange metadynamics protocol for antibody CDR loops (e.g. 10.1038/s42003-020-01319-z,
+    10.3389/fimmu.2021.630034), where PLUMED's MATHEVAL/COMBINE reduce all of a loop's psi angles
+    to one number so a single walker/replica can bias the whole loop with one 1-D CV, rather than
+    biasing every torsion of the loop independently.
+    """
+    atom_quads = []
+    for chain_id, residue_id in residues:
+        try:
+            atoms = resolve_phi_psi_atoms(topology, "psi", residue_id, chain_id)
+        except ValueError as exc:
+            logging.warning(f"Skipping residue {chain_id}{residue_id} in combined psi CV: {exc}")
+            continue
+        atom_quads.append(atoms)
+
+    if not atom_quads:
+        raise ValueError("build_loop_psi_sincos_cv: no residue in this loop had a computable psi torsion.")
+
+    expression = " + ".join(f"sin(psi{i}) + cos(psi{i})" for i in range(len(atom_quads)))
+    force = CustomCVForce(expression)
+    for i, atoms in enumerate(atom_quads):
+        torsion = CustomTorsionForce("theta")
+        torsion.addTorsion(*atoms)
+        force.addCollectiveVariable(f"psi{i}", torsion)
+
+    return force, tuple(atom_quads)
+
+
 def build_metadynamics(
     system,
     topology: Topology,
     metad_config: dict,
     temperature: Quantity,
     dt_ps: float,
-) -> tuple[Metadynamics, list[str], list[tuple[int, int, int, int]]]:
+) -> tuple[Metadynamics, list[str], list[tuple]]:
     variables = []
     cv_labels = []
     cv_atoms = []
 
     for cv in metad_config["cvs"]:
         cv_type = cv["type"]
+        grid_width = cv.get("grid_width")
+
+        if cv_type == "loop_psi_sincos":
+            residues = [tuple(r) for r in cv["residues"]]
+            force, atom_quads = build_loop_psi_sincos_cv(topology, residues)
+            n = len(atom_quads)
+
+            bound = cv.get("bound", n * math.sqrt(2))
+            bias_width = cv.get("bias_width", 0.3 * math.sqrt(n))
+
+            variables.append(
+                BiasVariable(force, -bound, bound, bias_width, periodic=False, gridWidth=grid_width)
+            )
+
+            label = cv.get("label") or "psi_sincos"
+            cv_labels.append(label)
+            cv_atoms.append(atom_quads)
+            logging.info(
+                f"Metadynamics CV '{label}': combined sin(psi)+cos(psi) over {n} residues, "
+                f"bound=+/-{bound:.3f}, bias_width={bias_width:.3f}, grid_width={grid_width or 'auto'}"
+            )
+            continue
+
         residue_id = cv["residue"]
         chain_id = cv.get("chain")
         bias_width_degrees = cv.get("bias_width_degrees", 25.0)
-        grid_width = cv.get("grid_width")
 
         atoms = resolve_phi_psi_atoms(topology, cv_type, residue_id, chain_id)
 
@@ -2580,7 +2653,7 @@ def build_metadynamics(
 class MetadynamicsGroup:
     meta: Metadynamics
     cv_labels: list[str]
-    cv_atoms: list[tuple[int, int, int, int]]
+    cv_atoms: list[tuple]  # each entry: a 4-atom-index tuple, or a tuple of those (combined CV)
 
 
 def build_metadynamics_groups(
@@ -2623,6 +2696,12 @@ IMGT_CDR_RANGES = {
 }
 
 VALID_CDR_LOOP_NAMES = {"H1", "H2", "H3", "L1", "L2", "L3"}
+
+# "per_residue_torsions" (default): bias every backbone phi/psi torsion of the loop independently.
+# "combined_psi_sincos": bias one scalar CV per loop, the sum of sin(psi)+cos(psi) over all of
+# the loop's residues, matching the CDR-loop CV used in Fernandez-Quintero et al.'s bias-exchange
+# metadynamics protocol (e.g. 10.1038/s42003-020-01319-z, 10.3389/fimmu.2021.630034).
+VALID_CDR_CV_STYLES = {"per_residue_torsions", "combined_psi_sincos"}
 
 
 def write_protein_only_pdb(topology: Topology, positions: Quantity, out_path: str) -> None:
@@ -2702,6 +2781,7 @@ def build_cdr_bias_exchange_config(args: argparse.Namespace, topology: Topology,
 
     requested_loops = auto_cfg.get("loops", sorted(VALID_CDR_LOOP_NAMES))
     bias_width_degrees = auto_cfg.get("bias_width_degrees", 25.0)
+    cv_style = auto_cfg.get("cv_style", "per_residue_torsions")
 
     walkers = []
     walker_labels = []
@@ -2713,11 +2793,31 @@ def build_cdr_bias_exchange_config(args: argparse.Namespace, topology: Topology,
             logging.warning(f"No residues found for CDR loop {loop_name}; skipping.")
             continue
 
-        cvs = [
-            {"type": torsion_type, "chain": chain_id, "residue": residue_id, "bias_width_degrees": bias_width_degrees}
-            for chain_id, residue_id in residues
-            for torsion_type in ("phi", "psi")
-        ]
+        if cv_style == "combined_psi_sincos":
+            # Fernandez-Quintero et al.'s CDR-loop bias-exchange metadynamics CV: one walker per
+            # loop, biasing the linear combination of sin(psi)+cos(psi) over the whole loop as a
+            # single collective variable, rather than every individual torsion.
+            cv = {
+                "type": "loop_psi_sincos",
+                "residues": [list(r) for r in residues],
+                "label": f"CDR-{loop_name}",
+            }
+            if "combined_cv_bias_width" in auto_cfg:
+                cv["bias_width"] = auto_cfg["combined_cv_bias_width"]
+            if "combined_cv_bound" in auto_cfg:
+                cv["bound"] = auto_cfg["combined_cv_bound"]
+            cvs = [cv]
+            logging.info(
+                f"CDR-{loop_name}: {len(residues)} residues, combined sin(psi)+cos(psi) CV "
+                "(1 collective variable)."
+            )
+        else:
+            cvs = [
+                {"type": torsion_type, "chain": chain_id, "residue": residue_id, "bias_width_degrees": bias_width_degrees}
+                for chain_id, residue_id in residues
+                for torsion_type in ("phi", "psi")
+            ]
+            logging.info(f"CDR-{loop_name}: {len(residues)} residues, {len(cvs)} torsions biased.")
 
         walker_cfg = {"cvs": cvs}
         for key in ("bias_factor", "height_kjmol", "deposition_interval_ps", "save_interval_ps"):
@@ -2726,8 +2826,6 @@ def build_cdr_bias_exchange_config(args: argparse.Namespace, topology: Topology,
 
         walkers.append(walker_cfg)
         walker_labels.append(f"CDR-{loop_name}")
-
-        logging.info(f"CDR-{loop_name}: {len(residues)} residues, {len(cvs)} torsions biased.")
 
     return {
         "enabled": True,
@@ -2741,11 +2839,15 @@ class MetadynamicsCVReporter:
     def __init__(self, meta: Metadynamics, cv_labels: list[str], csv_path: str, report_interval: int) -> None:
         self._meta = meta
         self._cv_labels = cv_labels
+        # Periodic CVs (plain torsions, range [-pi, pi]) are reported in degrees; non-periodic
+        # CVs (e.g. the combined loop_psi_sincos CV, which isn't an angle) are reported raw.
+        self._periodic = [v.periodic for v in meta.variables]
         self._reportInterval = report_interval
         self._csv_path = csv_path
 
+        headers = [f"{label}_deg" if p else f"{label}_raw" for label, p in zip(cv_labels, self._periodic)]
         with open(self._csv_path, "w") as f:
-            f.write("step,time_ps," + ",".join(f"{label}_deg" for label in cv_labels) + "\n")
+            f.write("step,time_ps," + ",".join(headers) + "\n")
 
     def describeNextReport(self, simulation: Simulation) -> tuple[int, bool, bool, bool, bool, bool]:
         steps = self._reportInterval - simulation.currentStep % self._reportInterval
@@ -2754,10 +2856,11 @@ class MetadynamicsCVReporter:
     def report(self, simulation: Simulation, state: State) -> None:
         dt_ps = simulation.integrator.getStepSize().value_in_unit(picoseconds)
         time_ps = simulation.currentStep * dt_ps
-        values_deg = [math.degrees(v) for v in self._meta.getCollectiveVariables(simulation)]
+        raw_values = self._meta.getCollectiveVariables(simulation)
+        values = [math.degrees(v) if p else v for v, p in zip(raw_values, self._periodic)]
 
         with open(self._csv_path, "a") as f:
-            f.write(f"{simulation.currentStep},{time_ps:.3f}," + ",".join(f"{v:.3f}" for v in values_deg) + "\n")
+            f.write(f"{simulation.currentStep},{time_ps:.3f}," + ",".join(f"{v:.3f}" for v in values) + "\n")
 
 
 class MultiGroupMetadynamicsCVReporter:
@@ -2769,8 +2872,12 @@ class MultiGroupMetadynamicsCVReporter:
         self._csv_path = csv_path
 
         all_labels = [label for group in groups for label in group.cv_labels]
+        self._periodic = [v.periodic for group in groups for v in group.meta.variables]
+        headers = [
+            f"{label}_deg" if p else f"{label}_raw" for label, p in zip(all_labels, self._periodic)
+        ]
         with open(self._csv_path, "w") as f:
-            f.write("step,time_ps," + ",".join(f"{label}_deg" for label in all_labels) + "\n")
+            f.write("step,time_ps," + ",".join(headers) + "\n")
 
     def describeNextReport(self, simulation: Simulation) -> tuple[int, bool, bool, bool, bool, bool]:
         steps = self._reportInterval - simulation.currentStep % self._reportInterval
@@ -2780,15 +2887,12 @@ class MultiGroupMetadynamicsCVReporter:
         dt_ps = simulation.integrator.getStepSize().value_in_unit(picoseconds)
         time_ps = simulation.currentStep * dt_ps
 
-        all_values_deg = [
-            math.degrees(v)
-            for group in self._groups
-            for v in group.meta.getCollectiveVariables(simulation)
-        ]
+        raw_values = [v for group in self._groups for v in group.meta.getCollectiveVariables(simulation)]
+        all_values = [math.degrees(v) if p else v for v, p in zip(raw_values, self._periodic)]
 
         with open(self._csv_path, "a") as f:
             f.write(
-                f"{simulation.currentStep},{time_ps:.3f}," + ",".join(f"{v:.3f}" for v in all_values_deg) + "\n"
+                f"{simulation.currentStep},{time_ps:.3f}," + ",".join(f"{v:.3f}" for v in all_values) + "\n"
             )
 
 
@@ -2821,6 +2925,22 @@ def compute_dihedral_radians(positions: np.ndarray, atom_indices: tuple[int, int
     y = np.dot(m1, n2)
 
     return float(math.atan2(y, x))
+
+
+def compute_cv_value(positions: np.ndarray, atom_spec) -> float:
+    """Compute one CV's value at an arbitrary configuration, mirroring what its Force reports.
+
+    `atom_spec` is either a single 4-atom-index tuple (a plain torsion CV: value = the dihedral
+    itself), or a tuple of such 4-atom-index tuples (the combined "loop_psi_sincos" CV built by
+    build_loop_psi_sincos_cv: value = sum of sin(psi)+cos(psi) over every sub-torsion).
+    """
+    if isinstance(atom_spec[0], tuple):
+        return sum(
+            math.sin(theta) + math.cos(theta)
+            for theta in (compute_dihedral_radians(positions, quad) for quad in atom_spec)
+        )
+
+    return compute_dihedral_radians(positions, atom_spec)
 
 
 def evaluate_metadynamics_bias(meta: Metadynamics, cv_values_radians: list[float]) -> float:
@@ -2873,7 +2993,7 @@ def _walker_bias_at(walker: "BiasExchangeWalker", positions: np.ndarray) -> floa
     """Sum this walker's bias (across all of its groups) evaluated at a given configuration."""
     total = 0.0
     for group in walker.groups:
-        cv_values = [compute_dihedral_radians(positions, atoms) for atoms in group.cv_atoms]
+        cv_values = [compute_cv_value(positions, atoms) for atoms in group.cv_atoms]
         total += evaluate_metadynamics_bias(group.meta, cv_values)
     return total
 
@@ -3164,8 +3284,14 @@ def run_production_bias_exchange(args: argparse.Namespace) -> None:
                     [
                         {
                             "label": label,
-                            "min_degrees": math.degrees(variable.minValue),
-                            "max_degrees": math.degrees(variable.maxValue),
+                            **(
+                                {
+                                    "min_degrees": math.degrees(variable.minValue),
+                                    "max_degrees": math.degrees(variable.maxValue),
+                                }
+                                if variable.periodic
+                                else {"min": variable.minValue, "max": variable.maxValue}
+                            ),
                             "grid_width": variable.gridWidth,
                         }
                         for label, variable in zip(group.cv_labels, group.meta.variables)
@@ -3292,8 +3418,14 @@ def run_production(args: argparse.Namespace) -> None:
                 [
                     {
                         "label": label,
-                        "min_degrees": math.degrees(variable.minValue),
-                        "max_degrees": math.degrees(variable.maxValue),
+                        **(
+                            {
+                                "min_degrees": math.degrees(variable.minValue),
+                                "max_degrees": math.degrees(variable.maxValue),
+                            }
+                            if variable.periodic
+                            else {"min": variable.minValue, "max": variable.maxValue}
+                        ),
                         "grid_width": variable.gridWidth,
                     }
                     for label, variable in zip(cv_labels, meta.variables)
@@ -3412,10 +3544,15 @@ def main() -> None:
         default=None,
         help=(
             "JSON object enabling automated bias-exchange metadynamics for antibody Fabs: "
-            "detects CDR loop residues with anarcii (pip install anarcii) and biases every "
-            "backbone torsion of each loop, one walker per CDR loop. Mutually exclusive with "
-            "--metadynamics and --bias_exchange. Example: "
-            '\'{"enabled": true, "loops": ["H1","H2","H3","L1","L2","L3"]}\'. '
+            "detects CDR loop residues with anarcii (pip install anarcii), one walker per CDR "
+            "loop. Mutually exclusive with --metadynamics and --bias_exchange. "
+            "'cv_style' selects what each walker biases: 'per_residue_torsions' (default) biases "
+            "every backbone phi/psi torsion of the loop independently; 'combined_psi_sincos' "
+            "biases one scalar CV per loop (the sum of sin(psi)+cos(psi) over the whole loop), "
+            "matching the CDR-loop CV used in Fernandez-Quintero et al.'s bias-exchange "
+            "metadynamics protocol (e.g. 10.1038/s42003-020-01319-z). Example: "
+            '\'{"enabled": true, "loops": ["H1","H2","H3","L1","L2","L3"], '
+            '"cv_style": "combined_psi_sincos"}\'. '
             "Normally supplied via --config."
         ),
     )
