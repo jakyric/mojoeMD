@@ -287,7 +287,7 @@ useful since those can be mislabeled or inconsistent across deposited structures
   "height_kjmol": 10.0,
   "combined_cv_bias_width": 0.3,
   "deposition_interval_ps": 2.0,
-  "exchange_interval_ps": 2.0
+  "exchange_interval_ps": 4.0
 }
 ```
 
@@ -328,7 +328,8 @@ OpenMM-based pipeline can:
 | Gaussian width | 0.3 rad | `combined_cv_bias_width: 0.3` (also the default) |
 | Bias factor | 10 | `bias_factor: 10.0` |
 | Deposition stride | every 1000 steps (~2 ps at their ~2 fs timestep) | `deposition_interval_ps: 2.0` |
-| Simulation length | 200 ns bias-exchange metadynamics per structure | `prod_ns: 200.0` |
+| Simulation length | 500 ns bias-exchange metadynamics per Fab (200 ns in the 2020 paper) | `prod_ns: 500.0` |
+| Exchange attempts | every 2000 steps (~4 ps at a 2 fs timestep), reported for a related paper from the group | `exchange_interval_ps: 4.0` |
 | Ensemble / temperature | NpT, 300 K | matches (default) |
 | Water model | TIP3P, 10 Å padding | matches (`water_model: tip3p`, default `solvent_padding: 1.0` nm) |
 | Protein force field | AMBER ff14SB | matches (`amber14/protein.ff14SB.xml`, hardcoded) |
@@ -338,9 +339,9 @@ AMBER/MOE toolchain the papers used rather than to the sampling method itself:
 
 - **CV coefficients:** the papers do not publish their PLUMED input, so the unweighted sum is an
   assumption based on COMBINE's defaults.
-- **Exchange attempt interval:** not stated in the papers; this pipeline keeps its own default
-  (`exchange_interval_ps: 2.0`). Each cycle, walkers are paired at random and each pair attempts
-  one swap.
+- **Exchange pairing:** the papers do not say how replicas are paired; here walkers are paired
+  at random each cycle and each pair attempts one swap. The timestep behind the "every 2000
+  steps" interval is assumed to be 2 fs.
 - **Charge neutralization:** the papers use AMBER/sander's uniform background charge; this
   OpenMM-based pipeline neutralizes with explicit ions (`ionic_strength`) instead, since PME in
   OpenMM requires a net-neutral unit cell built that way.

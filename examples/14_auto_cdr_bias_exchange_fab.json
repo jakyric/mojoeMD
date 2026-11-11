@@ -13,7 +13,7 @@
   "water_model": "tip3p",
   "timestep_fs": 4.0,
   "hydrogen_mass": 1.5,
-  "prod_ns": 200.0,
+  "prod_ns": 500.0,
   "auto_cdr_bias_exchange": {
     "enabled": true,
     "loops": ["H1", "H2", "H3", "L1", "L2", "L3"],
@@ -23,6 +23,6 @@
     "combined_cv_bias_width": 0.3,
     "deposition_interval_ps": 2.0,
     "save_interval_ps": 100.0,
-    "exchange_interval_ps": 2.0
+    "exchange_interval_ps": 4.0
   }
 }

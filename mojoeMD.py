@@ -3161,6 +3161,11 @@ def build_bias_exchange_walkers(
             f"Distributing {len(args.bias_exchange['walkers'])} bias-exchange walker(s) round-robin "
             f"across GPU device(s) {args.gpu_ids}."
         )
+    elif platform.getName() in ("CUDA", "OpenCL"):
+        logging.warning(
+            "gpu_ids is not set, so every bias-exchange walker runs on the platform's default GPU. "
+            "Set gpu_ids (e.g. --gpu_ids 0,1,2) to spread walkers across devices."
+        )
 
     for i, walker_cfg in enumerate(args.bias_exchange["walkers"]):
         label = walker_labels[i] if walker_labels else f"walker_{i:02d}"
@@ -3177,9 +3182,11 @@ def build_bias_exchange_walkers(
 
         integrator = LangevinMiddleIntegrator(temperature, 1 / picosecond, args.timestep_fs * femtoseconds)
         platform_properties = platform_properties_for_simulation(platform, args.gpu_ids, walker_index=i)
-        if platform_properties:
-            logging.info(f"Walker {label}: assigned to GPU device {platform_properties['DeviceIndex']}.")
         simulation = Simulation(topology, system, integrator, platform, platform_properties)
+
+        if platform.getName() in ("CUDA", "OpenCL"):
+            actual_device = platform.getPropertyValue(simulation.context, "DeviceIndex")
+            logging.info(f"Walker {label}: running on {platform.getName()} device {actual_device}.")
 
         checkpoint_path = os.path.join(walker_dir, "production.chk")
         final_checkpoint_path = os.path.join(walker_dir, "production_final.chk")
