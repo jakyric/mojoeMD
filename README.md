@@ -272,7 +272,7 @@ useful since those can be mislabeled or inconsistent across deposited structures
   `Metadynamics` limit).
 - `"combined_psi_sincos"`: bias one scalar CV per loop — the sum of sin(psi)+cos(psi) over every
   residue's backbone psi torsion in that loop, reducing the whole loop to a single collective
-  variable via a `CustomCVForce`. This matches the CDR-loop CV used in Fernandez-Quintero et
+  variable (a single `CustomTorsionForce`). This matches the CDR-loop CV used in Fernandez-Quintero et
   al.'s bias-exchange metadynamics protocol for antibody CDR loops (e.g.
   [10.1038/s42003-020-01319-z](https://doi.org/10.1038/s42003-020-01319-z),
   [10.3389/fimmu.2021.630034](https://doi.org/10.3389/fimmu.2021.630034)), where PLUMED's

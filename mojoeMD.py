@@ -23,7 +23,6 @@ import pdbfixer
 
 from openmm import (
     CustomBondForce,
-    CustomCVForce,
     CustomExternalForce,
     CustomTorsionForce,
     LangevinMiddleIntegrator,
@@ -2541,7 +2540,7 @@ def set_aside_stale_bias_dir(bias_dir: str, restart: bool) -> None:
 def build_loop_psi_sincos_cv(
     topology: Topology,
     residues: list[tuple[str, str]],
-) -> tuple[CustomCVForce, tuple[tuple[int, int, int, int], ...]]:
+) -> tuple[CustomTorsionForce, tuple[tuple[int, int, int, int], ...]]:
     """Build one scalar CV biasing a whole CDR loop at once: the sum of sin(psi)+cos(psi) over
     every residue's backbone psi torsion.
 
@@ -2567,12 +2566,12 @@ def build_loop_psi_sincos_cv(
     if not atom_quads:
         raise ValueError("build_loop_psi_sincos_cv: no residue in this loop had a computable psi torsion.")
 
-    expression = " + ".join(f"sin(psi{i}) + cos(psi{i})" for i in range(len(atom_quads)))
-    force = CustomCVForce(expression)
-    for i, atoms in enumerate(atom_quads):
-        torsion = CustomTorsionForce("theta")
-        torsion.addTorsion(*atoms)
-        force.addCollectiveVariable(f"psi{i}", torsion)
+    # One CustomTorsionForce whose total energy is the CV. Wrapping each torsion as its own
+    # variable of a CustomCVForce is mathematically the same but makes OpenMM evaluate every
+    # torsion in a separate GPU round trip on every step, which dominated the run time.
+    force = CustomTorsionForce("sin(theta) + cos(theta)")
+    for atoms in atom_quads:
+        force.addTorsion(*atoms)
 
     return force, tuple(atom_quads)
 
