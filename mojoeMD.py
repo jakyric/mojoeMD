@@ -3123,23 +3123,31 @@ def attempt_exchange(
     state_i = walker_i.simulation.context.getState(getPositions=True, getVelocities=True, enforcePeriodicBox=True)
     state_j = walker_j.simulation.context.getState(getPositions=True, getVelocities=True, enforcePeriodicBox=True)
 
-    positions_i = state_i.getPositions(asNumpy=True).value_in_unit(nanometer)
-    positions_j = state_j.getPositions(asNumpy=True).value_in_unit(nanometer)
+    # Keep everything as numpy arrays: passing per-atom Vec3 lists to setPositions/setVelocities
+    # costs ~100 ms per call for a solvated Fab, during which every GPU sits idle.
+    positions_i = state_i.getPositions(asNumpy=True)
+    positions_j = state_j.getPositions(asNumpy=True)
 
-    delta = metropolis_exchange_delta(walker_i, walker_j, positions_i, positions_j, temperature)
+    delta = metropolis_exchange_delta(
+        walker_i,
+        walker_j,
+        positions_i.value_in_unit(nanometer),
+        positions_j.value_in_unit(nanometer),
+        temperature,
+    )
     accepted = delta <= 0.0 or random.random() < math.exp(-delta)
 
     if accepted:
-        box_i = state_i.getPeriodicBoxVectors()
-        box_j = state_j.getPeriodicBoxVectors()
+        velocities_i = state_i.getVelocities(asNumpy=True)
+        velocities_j = state_j.getVelocities(asNumpy=True)
 
-        walker_i.simulation.context.setPositions(state_j.getPositions())
-        walker_i.simulation.context.setVelocities(state_j.getVelocities())
-        walker_i.simulation.context.setPeriodicBoxVectors(*box_j)
+        walker_i.simulation.context.setPeriodicBoxVectors(*state_j.getPeriodicBoxVectors())
+        walker_i.simulation.context.setPositions(positions_j)
+        walker_i.simulation.context.setVelocities(velocities_j)
 
-        walker_j.simulation.context.setPositions(state_i.getPositions())
-        walker_j.simulation.context.setVelocities(state_i.getVelocities())
-        walker_j.simulation.context.setPeriodicBoxVectors(*box_i)
+        walker_j.simulation.context.setPeriodicBoxVectors(*state_i.getPeriodicBoxVectors())
+        walker_j.simulation.context.setPositions(positions_i)
+        walker_j.simulation.context.setVelocities(velocities_i)
 
     return accepted, delta
 
@@ -3304,11 +3312,19 @@ def run_production_bias_exchange(args: argparse.Namespace) -> None:
     steps_done = 0
     cycle = 0
 
+    # Per-attempt results go to bias_exchange_log.csv; the main log gets a periodic summary of
+    # acceptance and of where wall time goes (integration vs. exchange bookkeeping).
+    summary_every = 100
+    step_seconds = exchange_seconds = 0.0
+    attempts = accepted_count = 0
+
     with ThreadPoolExecutor(max_workers=len(walkers)) as executor:
         while steps_done < production_steps:
             steps_this_cycle = min(exchange_interval, production_steps - steps_done)
 
+            t0 = time.perf_counter()
             step_walkers_concurrently(walkers, steps_this_cycle, executor)
+            t1 = time.perf_counter()
 
             steps_done += steps_this_cycle
 
@@ -3316,12 +3332,22 @@ def run_production_bias_exchange(args: argparse.Namespace) -> None:
                 for i, j in random_exchange_pairs(len(walkers)):
                     accepted, delta = attempt_exchange(walkers[i], walkers[j], temperature)
                     f.write(f"{cycle},{steps_done},{i},{j},{delta:.4f},{int(accepted)}\n")
-                    logging.info(
-                        f"Exchange attempt cycle={cycle} walkers=({walkers[i].label},{walkers[j].label}) "
-                        f"delta={delta:.3f} accepted={accepted}"
-                    )
+                    attempts += 1
+                    accepted_count += int(accepted)
 
+            step_seconds += t1 - t0
+            exchange_seconds += time.perf_counter() - t1
             cycle += 1
+
+            if cycle % summary_every == 0 and attempts:
+                logging.info(
+                    f"Bias-exchange cycles {cycle - summary_every}-{cycle}: "
+                    f"{accepted_count}/{attempts} exchanges accepted; per cycle "
+                    f"{step_seconds / summary_every:.2f} s integrating, "
+                    f"{exchange_seconds / summary_every:.3f} s exchanging."
+                )
+                step_seconds = exchange_seconds = 0.0
+                attempts = accepted_count = 0
 
     for walker in walkers:
         logging.info(f"Walker {walker.label}: saving final checkpoint to {walker.final_checkpoint_path}")
